@@ -25,6 +25,9 @@
       "GM_addStyle",
       "MutationObserver",
       "unsafeWindow"
+    ],
+    "ignore": [
+      "Epic-Add2Lib.user.js"
     ]
   }
 }

@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name               Epic-Add2Lib
 // @namespace          Epic-Add2Lib
-// @version            1.0.0
+// @version            1.0.1
 // @description        Epic 快速领取免费游戏
 // @author             HCLonely
 // @license            MIT
@@ -64,8 +64,11 @@
         }
         let offers = []
         for (const page of response.response.pages) {
-          const editions = page.data.editions.editions || []
-          const dlcs = page.data.dlc.dlc || []
+          const editions = page.data?.editions?.editions || []
+          const dlcs = page.data?.dlc?.dlc || []
+          if (page.offer?.id) {
+            offers.push(page.offer.id)
+          }
           for (const info of [...editions, ...dlcs]) {
             offers.push(info.offerId)
           }
@@ -128,7 +131,7 @@
           const freeOffers = []
           if (response.response?.length > 0) {
             for (const info of response.response) {
-              const price = info.data.Catalog.catalogOffer.price.totalPrice.discountPrice
+              const price = info?.data?.Catalog?.catalogOffer?.price?.totalPrice?.discountPrice
               if (price === 0) {
                 freeOffers.push({ title: info.data.Catalog.catalogOffer.title, id: info.data.Catalog.catalogOffer.id })
               }
@@ -146,7 +149,68 @@
         }
       })
   }
-  function requestOrderPage (namespace, offer, title) {
+  // TODO: 未完成
+  async function authenticate (referer) {
+    Swal.fire({
+      title: '正在进行身份验证...',
+      text: '',
+      icon: 'info'
+    })
+    const result = await TM_request({
+      url: 'https://www.epicgames.com/id/api/authenticate',
+      method: 'GET',
+      nocache: true,
+      timeout: 30000,
+      retry: 3,
+      headers: {
+        'x-epic-event-action': null,
+        'x-epic-event-category': null,
+        'x-epic-strategy-flags': 'guardianEmailVerifyEnabled=false;minorPreRegisterEnabled=false;guardianKwsFlowEnabled=false',
+        referer: referer
+      }
+    })
+      .then(response => {
+        if (response.status === 200) {
+          return true
+        } else {
+          console.error(response)
+          Swal.update({
+            title: '身份验证失败！',
+            html: '<a href="https://www.epicgames.com/id/login" target="_blank">点此登录</a>',
+            icon: 'error'
+          })
+          return false
+        }
+      })
+    if (!result) return false
+    return await TM_request({
+      url: 'https://www.epicgames.com/id/api/csrf',
+      method: 'GET',
+      nocache: true,
+      timeout: 30000,
+      retry: 3,
+      headers: {
+        'x-epic-event-action': 'login',
+        'x-epic-event-category': 'login',
+        'x-epic-strategy-flags': 'guardianEmailVerifyEnabled=false;minorPreRegisterEnabled=false;guardianKwsFlowEnabled=false',
+        referer: referer
+      }
+    })
+      .then(response => {
+        if (response.status >= 200 && response.status < 300) {
+          return true
+        } else {
+          console.error(response)
+          Swal.update({
+            title: '身份验证失败！',
+            html: '<a href="https://www.epicgames.com/id/login" target="_blank">点此登录</a>',
+            icon: 'error'
+          })
+          return false
+        }
+      })
+  }
+  function requestOrderPage (namespace, offer, title, times = 0) {
     const url = `https://www.epicgames.com/store/purchase?namespace=${namespace}&offers=${offer}`
     Swal.fire({
       title: '正在请求下单页面...',
@@ -160,16 +224,24 @@
       timeout: 30000,
       retry: 3
     })
-      .then(response => {
+      .then(async response => {
         if (response.status === 200 && response.responseText) {
           if (response.finalUrl.includes('www.epicgames.com/id/login')) {
-            console.error(response)
-            Swal.fire({
-              title: '请先登录！',
-              html: '<a href="https://www.epicgames.com/login" target="_blank">点此登录</a>',
-              icon: 'error'
-            })
-            return null
+            if (times === 0) {
+              if (await authenticate(url)) {
+                return requestOrderPage(namespace, offer, title, 1)
+              } else {
+                return null
+              }
+            } else {
+              console.error(response)
+              Swal.fire({
+                title: '请先登录！',
+                html: '<a href="https://www.epicgames.com/id/login" target="_blank">点此登录</a>',
+                icon: 'error'
+              })
+              return null
+            }
           }
           const XQW = response.responseText.match(/id="purchaseToken"[\s]*?value="(.*?)"/)?.[1]
           const dfpSessionId = response.responseText.match(/window\.dfpSessionId[\s]*?=[\s]*?'(.*?)'/)?.[1]
@@ -269,15 +341,7 @@
         }
       })
   }
-  async function getGame ({ title, id }, namespace) {
-    const data = await orderPreview(namespace, id, title)
-    if (!data) return null
-    const { XQW, dfpSessionId, syncToken } = data
-    Swal.update({
-      title: '正在领取...',
-      text: id,
-      icon: 'info'
-    })
+  function confirmOrder (namespace, id, title, XQW, dfpSessionId, syncToken, times = 0) {
     return TM_request({
       url: 'https://payment-website-pci.ol.epicgames.com/purchase/confirm-order',
       method: 'POST',
@@ -306,7 +370,7 @@
         lineOffers: [
           {
             offerId: id,
-            title: title || data.title,
+            title: title,
             namespace,
             upgradePathId: null
           }
@@ -328,30 +392,55 @@
     })
       .then(response => {
         if (response.status === 200 && response.response) {
-          if (!response.response.message) {
+          if (!response.response.message && !response.response.errorCode) {
             Swal.update({
               title: '领取成功！',
-              text: id,
+              text: `${title}(${id})`,
               icon: 'success'
             })
+            return true
+          } else if (response.response.syncToken && response.response.errorCode === 'errors.com.epicgames.purchase.purchase.captcha.challenge') {
+            if (times === 0) {
+              return confirmOrder(namespace, id, title, XQW, dfpSessionId, response.response.syncToken, 1)
+            } else {
+              console.error(response)
+              Swal.update({
+                title: '领取失败！',
+                text: `${title}(${id})`,
+                icon: 'error'
+              })
+              return null
+            }
           } else {
             console.error(response)
             Swal.update({
               title: response.response.message,
-              text: id,
+              text: `${title}(${id})`,
               icon: 'info'
             })
+            return null
           }
         } else {
           console.error(response)
           Swal.update({
             title: response.response.message || '领取失败！',
-            text: id,
+            text: `${title}(${id})`,
             icon: 'error'
           })
           return null
         }
       })
+  }
+  async function getGame ({ title, id }, namespace) {
+    const data = await orderPreview(namespace, id, title)
+    if (!data) return null
+    const { XQW, dfpSessionId, syncToken } = data
+    Swal.update({
+      title: '正在领取...',
+      text: `${title}(${id})`,
+      icon: 'info'
+    })
+    return await confirmOrder(namespace, id, title || data.title, XQW, dfpSessionId, syncToken, 0)
   }
   unsafeWindow.addToEpicLibrary = async function (el) {
     const href = typeof el === 'string' ? el : $(el).attr('data-href')
